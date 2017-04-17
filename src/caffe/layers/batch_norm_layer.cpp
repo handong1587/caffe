@@ -48,6 +48,10 @@ void BatchNormLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
   }
 }
 
+// some comments by: http://blog.csdn.net/mrhiuser/article/details/52575951
+// BN不是针对x（输入的），而是针对Wx+b的, Wx+b的均值和方差是对整张map求得的
+// 在batch_size * channel * height * width这么大的一层中, 
+// 对总共batch_size * height * width个像素点统计得到一个均值和一个标准差, 共得到channel组参数
 template <typename Dtype>
 void BatchNormLayer<Dtype>::Reshape(const vector<Blob<Dtype>*>& bottom,
       const vector<Blob<Dtype>*>& top) {
@@ -57,20 +61,22 @@ void BatchNormLayer<Dtype>::Reshape(const vector<Blob<Dtype>*>& bottom,
 
   vector<int> sz;
   sz.push_back(channels_);
-  mean_.Reshape(sz);
-  variance_.Reshape(sz);
-  temp_.ReshapeLike(*bottom[0]);
+  mean_.Reshape(sz);                //通道数,即channel值大小, 存储的是均值
+  variance_.Reshape(sz);            //通道数,即channel值大小, 存储的是方差值
+  temp_.ReshapeLike(*bottom[0]);    //temp_中存储的是减去mean_后的每一个数的方差值
   x_norm_.ReshapeLike(*bottom[0]);
   sz[0] = bottom[0]->shape(0);
   batch_sum_multiplier_.Reshape(sz);
 
-  int spatial_dim = bottom[0]->count()/(channels_*bottom[0]->shape(0));
+  //spatial_sum_multiplier_是一副图像大小的空间(height*width), 并初始化值为 1,
+  //作用是在计算mean_时辅助通过乘的方式将一副图像的值相加, 结果是一个数值
+  int spatial_dim = bottom[0]->count()/(channels_*bottom[0]->shape(0));  //图像height*width
   if (spatial_sum_multiplier_.num_axes() == 0 ||
       spatial_sum_multiplier_.shape(0) != spatial_dim) {
     sz[0] = spatial_dim;
     spatial_sum_multiplier_.Reshape(sz);
-    Dtype* multiplier_data = spatial_sum_multiplier_.mutable_cpu_data();
-    caffe_set(spatial_sum_multiplier_.count(), Dtype(1), multiplier_data);
+    Dtype* multiplier_data = spatial_sum_multiplier_.mutable_cpu_data();  //分配一副图像的空间
+    caffe_set(spatial_sum_multiplier_.count(), Dtype(1), multiplier_data);//初始化值为 1
   }
 
   int numbychans = channels_*bottom[0]->shape(0);
@@ -78,6 +84,7 @@ void BatchNormLayer<Dtype>::Reshape(const vector<Blob<Dtype>*>& bottom,
       num_by_chans_.shape(0) != numbychans) {
     sz[0] = numbychans;
     num_by_chans_.Reshape(sz);
+    //batch_sum_multiplier_: batch_size大小的空间, 也是辅助在计算mean_时, 将所要图像的相应的通道值相加
     caffe_set(batch_sum_multiplier_.count(), Dtype(1),
         batch_sum_multiplier_.mutable_cpu_data());
   }
@@ -89,8 +96,9 @@ void BatchNormLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
   const Dtype* bottom_data = bottom[0]->cpu_data();
   Dtype* top_data = top[0]->mutable_cpu_data();
   int num = bottom[0]->shape(0);
-  int spatial_dim = bottom[0]->count()/(bottom[0]->shape(0)*channels_);
+  int spatial_dim = bottom[0]->count()/(bottom[0]->shape(0)*channels_);  //spatial_dim值是图像height*width
 
+  //如果底层的blob与顶层的blob不是同一个blob
   if (bottom[0] != top[0]) {
     caffe_copy(bottom[0]->count(), bottom_data, top_data);
   }
@@ -105,53 +113,66 @@ void BatchNormLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
         this->blobs_[1]->cpu_data(), variance_.mutable_cpu_data());
   } else {
     // compute mean
+    //将每一副图像值相加为一个值, 共有channels_ * num个值
+    //然后再乘以 1/(num * spatial_dim), 结果存储到blob: num_by_chans_中
     caffe_cpu_gemv<Dtype>(CblasNoTrans, channels_ * num, spatial_dim,
         1. / (num * spatial_dim), bottom_data,
         spatial_sum_multiplier_.cpu_data(), 0.,
         num_by_chans_.mutable_cpu_data());
+    //上面计算得到的值大小是num*channel, 将图像的每个通道的值相加, 最后获得channel个数值, 结果存储到mean_中 
     caffe_cpu_gemv<Dtype>(CblasTrans, num, channels_, 1.,
         num_by_chans_.cpu_data(), batch_sum_multiplier_.cpu_data(), 0.,
         mean_.mutable_cpu_data());
   }
 
   // subtract mean
+  //将channels_个值的均值mean_矩阵扩展到num_*channels_*height*width, 并用top_data数据减去均值
   caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, num, channels_, 1, 1,
       batch_sum_multiplier_.cpu_data(), mean_.cpu_data(), 0.,
       num_by_chans_.mutable_cpu_data());
   caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, channels_ * num,
       spatial_dim, 1, -1, num_by_chans_.cpu_data(),
-      spatial_sum_multiplier_.cpu_data(), 1., top_data);
+      spatial_sum_multiplier_.cpu_data(), 1., top_data);  //用blob: top_data中的数据减去mean_值
 
   if (!use_global_stats_) {
     // compute variance using var(X) = E((X-EX)^2)
+    //对向量的每一个值求方差, 结果存储到blob temp_中
     caffe_sqr<Dtype>(top[0]->count(), top_data,
                      temp_.mutable_cpu_data());  // (X-EX)^2
+    //同上计算 mean_的方式, 矩阵 向量 乘
     caffe_cpu_gemv<Dtype>(CblasNoTrans, channels_ * num, spatial_dim,
         1. / (num * spatial_dim), temp_.cpu_data(),
         spatial_sum_multiplier_.cpu_data(), 0.,
         num_by_chans_.mutable_cpu_data());
+    //同上计算 mean_的方式, 矩阵 向量 乘 (此处num_by_chans_转置)  
     caffe_cpu_gemv<Dtype>(CblasTrans, num, channels_, 1.,
         num_by_chans_.cpu_data(), batch_sum_multiplier_.cpu_data(), 0.,
         variance_.mutable_cpu_data());  // E((X_EX)^2)
 
     // compute and save moving average
+    // scale_factor_new = moving_average_fraction_ * scale_factor_old + 1
     this->blobs_[2]->mutable_cpu_data()[0] *= moving_average_fraction_;
     this->blobs_[2]->mutable_cpu_data()[0] += 1;
+    // mean_new = moving_average_fraction_ * mean_old + mean_current
     caffe_cpu_axpby(mean_.count(), Dtype(1), mean_.cpu_data(),
         moving_average_fraction_, this->blobs_[0]->mutable_cpu_data());
-    int m = bottom[0]->count()/channels_;
-    Dtype bias_correction_factor = m > 1 ? Dtype(m)/(m-1) : 1;
+    int m = bottom[0]->count()/channels_;  //计算元素的数目
+    Dtype bias_correction_factor = m > 1 ? Dtype(m)/(m-1) : 1; //无偏估计
+    // var_new = moving_average_fraction_ * var_old + (m)/(m-1) * var_current
     caffe_cpu_axpby(variance_.count(), bias_correction_factor,
         variance_.cpu_data(), moving_average_fraction_,
         this->blobs_[1]->mutable_cpu_data());
   }
 
   // normalize variance
+  //将 variance 每个值加一个很小的值 eps_, 防止除 0 的情况
   caffe_add_scalar(variance_.count(), eps_, variance_.mutable_cpu_data());
+  //对 variance 的每个值 求开方
   caffe_sqrt(variance_.count(), variance_.cpu_data(),
              variance_.mutable_cpu_data());
 
   // replicate variance to input size
+  //以下这两个函数同上面的mean_一样, 将channels_个值的方差variance_矩阵扩展到num_*channels_*height*width  
   caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, num, channels_, 1, 1,
       batch_sum_multiplier_.cpu_data(), variance_.cpu_data(), 0.,
       num_by_chans_.mutable_cpu_data());
@@ -161,6 +182,7 @@ void BatchNormLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
   caffe_div(temp_.count(), top_data, temp_.cpu_data(), top_data);
   // TODO(cdoersch): The caching is only needed because later in-place layers
   //                 might clobber the data.  Can we skip this if they won't?
+  //将 最后的结果top_data 数据复制 到 x_norm_中
   caffe_copy(x_norm_.count(), top_data,
       x_norm_.mutable_cpu_data());
 }
