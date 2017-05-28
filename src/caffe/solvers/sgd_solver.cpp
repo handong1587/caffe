@@ -105,10 +105,14 @@ void SGDSolver<Dtype>::ApplyUpdate() {
     LOG_IF(INFO, Caffe::root_solver()) << "Iteration " << this->iter_
         << ", lr = " << rate;
   }
+  // 避免梯度爆炸，如果梯度的二范数超过了某个数值则进行scale操作，将梯度减小
   ClipGradients();
   for (int param_id = 0; param_id < this->net_->learnable_params().size();
        ++param_id) {
+    // 将第param_id个参数的梯度除以iter_size
+    // 这一步的作用是保证实际的batch_size=iter_size*设置的batch_size
     Normalize(param_id);
+    // 将正则化部分的梯度加入到每个参数的梯度中 
     Regularize(param_id);
     ComputeUpdateValue(param_id, rate);
   }
@@ -120,6 +124,7 @@ void SGDSolver<Dtype>::Normalize(int param_id) {
   if (this->param_.iter_size() == 1) { return; }
   // Scale gradient to counterbalance accumulation.
   const vector<Blob<Dtype>*>& net_params = this->net_->learnable_params();
+  // accum_normalization = 1/iter_size
   const Dtype accum_normalization = Dtype(1.) / this->param_.iter_size();
   switch (Caffe::mode()) {
   case Caffe::CPU: {
@@ -154,14 +159,19 @@ void SGDSolver<Dtype>::Regularize(int param_id) {
     if (local_decay) {
       if (regularization_type == "L2") {
         // add weight decay
+        // L2的梯度为diff_ = weight_decay*data_ + diff_
+        // caffe_axpy的功能是 y = a*x + y
         caffe_axpy(net_params[param_id]->count(),
             local_decay,
             net_params[param_id]->cpu_data(),
             net_params[param_id]->mutable_cpu_diff());
       } else if (regularization_type == "L1") {
+        // L1的梯度为diff_ = diff_ + sign(data_)
+        // temp_ = sign(data_)
         caffe_cpu_sign(net_params[param_id]->count(),
             net_params[param_id]->cpu_data(),
             temp_[param_id]->mutable_cpu_data());
+        // 将temp_加到diff_中 diff_ = weight_decay*temp_ + diff_
         caffe_axpy(net_params[param_id]->count(),
             local_decay,
             temp_[param_id]->cpu_data(),
@@ -218,9 +228,12 @@ void SGDSolver<Dtype>::ComputeUpdateValue(int param_id, Dtype rate) {
   // Compute the update to history, then copy it to the parameter diff.
   switch (Caffe::mode()) {
   case Caffe::CPU: {
+    // history_存储了上一次的梯度
+    // history_ = learning_rate*diff_ + momentum*history_
     caffe_cpu_axpby(net_params[param_id]->count(), local_rate,
               net_params[param_id]->cpu_diff(), momentum,
               history_[param_id]->mutable_cpu_data());
+    // 把当前的梯度拷贝给参数Blob的diff_
     caffe_copy(net_params[param_id]->count(),
         history_[param_id]->cpu_data(),
         net_params[param_id]->mutable_cpu_diff());
